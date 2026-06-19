@@ -1,10 +1,9 @@
-import argparse
 import os
+import re
 from pathlib import Path
 from typing import List, Dict
 
 import chromadb
-from chromadb.config import Settings
 from sentence_transformers import SentenceTransformer
 import pdfplumber
 
@@ -21,42 +20,112 @@ def load_pdf_text(pdf_path: str) -> List[Dict[str, object]]:
     return pages
 
 
-def chunk_text(text: str, chunk_size: int = 300, chunk_overlap: int = 50) -> List[str]:
-    """Split text into overlapping chunks by word count."""
-    words = text.split()
-    if not words:
-        return []
+def parse_source_metadata(pdf_path: str) -> Dict[str, object]:
+    """Extract document, company, and quarter metadata from a PDF filename."""
+    filename = Path(pdf_path).name
+    stem = Path(pdf_path).stem.replace(" ", "_")
+    parts = [part for part in stem.split("_") if part]
 
-    chunks = []
-    start = 0
-    while start < len(words):
-        end = min(start + chunk_size, len(words))
-        chunk = " ".join(words[start:end])
-        chunks.append(chunk)
-        if end == len(words):
-            break
-        start += chunk_size - chunk_overlap
-    return chunks
+    metadata: Dict[str, object] = {
+        "document": filename,
+        "source": stem,
+    }
+
+    quarter_match = re.match(r"^(\d{4})[_ ]?(Q[1-4])", stem, re.IGNORECASE)
+    if quarter_match:
+        metadata["quarter"] = f"{quarter_match.group(1)}_{quarter_match.group(2).upper()}"
+
+    if len(parts) >= 3 and parts[0].isdigit() and parts[1].upper().startswith("Q"):
+        metadata["company"] = parts[2].upper()
+    elif parts:
+        metadata["company"] = parts[-1].upper()
+
+    return metadata
+
+
+def recursive_character_split(
+    text: str,
+    chunk_size: int = 1000,
+    chunk_overlap: int = 200,
+) -> List[str]:
+    """Split text with a recursive character splitter (LangChain-style separators)."""
+    if not text.strip():
+        return []
+    if len(text) <= chunk_size:
+        return [text.strip()]
+
+    separators = ["\n\n", "\n", ". ", " ", ""]
+    for separator in separators:
+        if separator and separator not in text:
+            continue
+
+        if separator == "":
+            chunks = []
+            start = 0
+            while start < len(text):
+                end = start + chunk_size
+                chunks.append(text[start:end].strip())
+                if end >= len(text):
+                    break
+                start = max(end - chunk_overlap, start + 1)
+            return [chunk for chunk in chunks if chunk]
+
+        parts = text.split(separator)
+        chunks: List[str] = []
+        current = ""
+
+        for index, part in enumerate(parts):
+            segment = part if index == len(parts) - 1 else part + separator
+            if len(current) + len(segment) <= chunk_size:
+                current += segment
+                continue
+
+            if current.strip():
+                chunks.append(current.strip())
+
+            if len(segment) > chunk_size:
+                chunks.extend(recursive_character_split(segment, chunk_size, chunk_overlap))
+                current = ""
+            elif chunk_overlap and current:
+                current = current[-chunk_overlap:] + segment
+            else:
+                current = segment
+
+        if current.strip():
+            chunks.append(current.strip())
+
+        return [chunk for chunk in chunks if chunk]
+
+    return [text.strip()]
 
 
 def build_documents(pdf_path: str, chunk_size: int, chunk_overlap: int) -> List[Dict[str, object]]:
-    """Load one PDF and create chunk metadata for Chroma ingestion."""
-    source_name = Path(pdf_path).stem.replace(" ", "_")
+    """Load one PDF and create enriched chunk metadata for Chroma ingestion."""
+    source_metadata = parse_source_metadata(pdf_path)
+    source_name = str(source_metadata["source"])
     pages = load_pdf_text(pdf_path)
 
     documents = []
+    chunk_counter = 0
     for page_info in pages:
         page_number = page_info["page"]
-        chunks = chunk_text(page_info["text"], chunk_size=chunk_size, chunk_overlap=chunk_overlap)
+        chunks = recursive_character_split(
+            page_info["text"],
+            chunk_size=chunk_size,
+            chunk_overlap=chunk_overlap,
+        )
         for chunk_index, chunk in enumerate(chunks, start=1):
+            chunk_counter += 1
+            chunk_id = f"chunk_{chunk_counter}"
             documents.append(
                 {
                     "id": f"{source_name}-p{page_number}-c{chunk_index}",
                     "document": chunk,
                     "metadata": {
-                        "source": source_name,
+                        **source_metadata,
                         "page": page_number,
                         "chunk": chunk_index,
+                        "chunk_id": chunk_id,
                     },
                 }
             )
@@ -72,7 +141,7 @@ def create_chroma_collection(
 ):
     """Create or replace a Chroma collection and persist embeddings locally."""
     os.makedirs(persist_directory, exist_ok=True)
-    client = chromadb.Client(Settings(chroma_db_impl="duckdb+parquet", persist_directory=persist_directory))
+    client = chromadb.PersistentClient(path=persist_directory)
 
     if collection_name in [col.name for col in client.list_collections()]:
         client.delete_collection(name=collection_name)
@@ -93,13 +162,12 @@ def create_chroma_collection(
         documents=texts,
         embeddings=embeddings,
     )
-    client.persist()
     return client, collection
 
 
 def load_chroma_collection(collection_name: str, persist_directory: str):
     os.makedirs(persist_directory, exist_ok=True)
-    client = chromadb.Client(Settings(chroma_db_impl="duckdb+parquet", persist_directory=persist_directory))
+    client = chromadb.PersistentClient(path=persist_directory)
     if collection_name not in [col.name for col in client.list_collections()]:
         raise ValueError(f"Collection '{collection_name}' not found in '{persist_directory}'")
     collection = client.get_collection(name=collection_name)
@@ -107,7 +175,7 @@ def load_chroma_collection(collection_name: str, persist_directory: str):
 
 
 def collection_to_documents(collection) -> List[Dict[str, object]]:
-    records = collection.get(include=["ids", "documents", "metadatas"])
+    records = collection.get(include=["documents", "metadatas"])
     return [
         {"id": doc_id, "document": text, "metadata": metadata}
         for doc_id, text, metadata in zip(records["ids"], records["documents"], records["metadatas"])

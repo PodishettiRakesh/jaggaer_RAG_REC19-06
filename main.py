@@ -1,8 +1,44 @@
 import argparse
 from pathlib import Path
+from dotenv import load_dotenv
+load_dotenv()  
 
+import argparse
+# from pathlib import Path
+
+# from context_builder import build_context
+...
+from context_builder import build_context
+from generation import format_sources_section, generate_answer
 from load_and_embed import build_documents, create_chroma_collection, load_chroma_collection
 from retrieval import hybrid_search
+
+
+def add_retrieval_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--collection-name", default="kg_rag_single_doc", help="Chroma collection name.")
+    parser.add_argument("--persist-dir", default="./chroma_db", help="Chroma persistence directory.")
+    parser.add_argument("--top-k", type=int, default=5, help="Number of final chunks to return.")
+    parser.add_argument(
+        "--retrieve-k",
+        type=int,
+        default=20,
+        help="Number of candidates to retrieve from each search method before fusion.",
+    )
+    parser.add_argument("--model-name", default="all-MiniLM-L6-v2", help="Sentence Transformers model name.")
+    parser.add_argument("--dense-weight", type=float, default=0.5, help="Weight for dense retrieval scoring.")
+    parser.add_argument("--sparse-weight", type=float, default=0.5, help="Weight for sparse retrieval scoring.")
+
+
+def retrieve_chunks(args, collection):
+    return hybrid_search(
+        collection,
+        query=args.query,
+        model_name=args.model_name,
+        top_k=args.top_k,
+        retrieve_k=args.retrieve_k,
+        dense_weight=args.dense_weight,
+        sparse_weight=args.sparse_weight,
+    )
 
 
 def run_ingest(args):
@@ -28,15 +64,7 @@ def run_ingest(args):
 
 def run_query(args):
     _, collection = load_chroma_collection(args.collection_name, args.persist_dir)
-    results = hybrid_search(
-        collection,
-        query=args.query,
-        model_name=args.model_name,
-        top_k=args.top_k,
-        retrieve_k=args.retrieve_k,
-        dense_weight=args.dense_weight,
-        sparse_weight=args.sparse_weight,
-    )
+    results = retrieve_chunks(args, collection)
 
     print(f"Hybrid search results for: {args.query}\n")
     for idx, result in enumerate(results, start=1):
@@ -56,6 +84,19 @@ def run_query(args):
         print("---")
 
 
+def run_ask(args):
+    _, collection = load_chroma_collection(args.collection_name, args.persist_dir)
+    chunks = retrieve_chunks(args, collection)
+    context, citations = build_context(chunks)
+    answer = generate_answer(args.query, context, model=args.gemini_model)
+
+    print(f"Question: {args.query}\n")
+    print("Answer:")
+    print(answer)
+    print()
+    print(format_sources_section(citations))
+
+
 def main():
     parser = argparse.ArgumentParser(description="Document ingestion and hybrid retrieval for RAG.")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -70,24 +111,20 @@ def main():
 
     query = subparsers.add_parser("query", help="Run hybrid search against an existing collection.")
     query.add_argument("query", help="Search query text.")
-    query.add_argument("--collection-name", default="kg_rag_single_doc", help="Chroma collection name.")
-    query.add_argument("--persist-dir", default="./chroma_db", help="Chroma persistence directory.")
-    query.add_argument("--top-k", type=int, default=5, help="Number of final chunks to return.")
-    query.add_argument(
-        "--retrieve-k",
-        type=int,
-        default=20,
-        help="Number of candidates to retrieve from each search method before fusion.",
-    )
-    query.add_argument("--model-name", default="all-MiniLM-L6-v2", help="Sentence Transformers model name.")
-    query.add_argument("--dense-weight", type=float, default=0.5, help="Weight for dense retrieval scoring.")
-    query.add_argument("--sparse-weight", type=float, default=0.5, help="Weight for sparse retrieval scoring.")
+    add_retrieval_args(query)
+
+    ask = subparsers.add_parser("ask", help="Retrieve context and generate a grounded answer with Gemini.")
+    ask.add_argument("query", help="Question to answer.")
+    ask.add_argument("--gemini-model", default=None, help="Gemini model name (defaults to GEMINI_MODEL in .env).")
+    add_retrieval_args(ask)
 
     args = parser.parse_args()
     if args.command == "ingest":
         run_ingest(args)
     elif args.command == "query":
         run_query(args)
+    elif args.command == "ask":
+        run_ask(args)
 
 
 if __name__ == "__main__":
